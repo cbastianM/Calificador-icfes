@@ -3,6 +3,7 @@ import pandas as pd
 import json
 import unicodedata
 import re
+import io
 
 st.set_page_config(page_title="Calificador de Simulacros", page_icon="📝", layout="wide")
 
@@ -339,6 +340,7 @@ st.sidebar.divider()
 
 json_file = st.sidebar.file_uploader("Sube el JSON del estudiante", type=["json"])
 csv_file = st.sidebar.file_uploader("Sube el CSV con respuestas correctas", type=["csv"])
+
 # ─────────────────────────────────────────────
 
 def normalizar(texto: str) -> str:
@@ -367,6 +369,88 @@ def icono_materia(materia):
         "Inglés": "🌐",
     }.get(materia, "📘")
 
+
+def parsear_csv_respuestas(csv_file):
+    """
+    Parsea el CSV de respuestas correctas que tiene formato de columnas pareadas:
+    pregunta,materia1,pregunta,materia2,pregunta,materia3,...
+    
+    Cada par (pregunta, materia) tiene su propio rango de números de pregunta.
+    Retorna un dict: { "nombre_materia_normalizado": { "num_pregunta": "RESPUESTA", ... }, ... }
+    """
+    csv_file.seek(0)
+    raw = csv_file.read()
+    if isinstance(raw, bytes):
+        # Intentar decodificar con diferentes encodings
+        for enc in ["utf-8-sig", "utf-8", "latin-1"]:
+            try:
+                text = raw.decode(enc)
+                break
+            except:
+                text = raw.decode("latin-1")
+    else:
+        text = raw
+    
+    lines = text.strip().replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if len(lines) < 2:
+        return {}
+    
+    # Leer encabezados
+    headers = lines[0].split(",")
+    
+    # Identificar pares de columnas: buscar columnas que NO sean "pregunta"
+    # El formato es: pregunta,materia1,pregunta,materia2,...
+    materias_info = []  # Lista de (indice_col_pregunta, indice_col_respuesta, nombre_materia)
+    
+    i = 0
+    while i < len(headers) - 1:
+        h = normalizar(headers[i])
+        if h == "pregunta":
+            # La siguiente columna es el nombre de la materia
+            nombre_materia = normalizar(headers[i + 1])
+            materias_info.append((i, i + 1, nombre_materia))
+            i += 2
+        else:
+            i += 1
+    
+    # Mapeo de nombres normalizados del CSV a nombres de visualización
+    nombre_display = {
+        "matematicas": "Matemáticas",
+        "lectura": "Lectura crítica",
+        "sociales": "Sociales y ciudadanas",
+        "naturales": "Ciencias naturales",
+        "ingles": "Inglés",
+        # Variantes adicionales
+        "lectura critica": "Lectura crítica",
+        "ciencias naturales": "Ciencias naturales",
+        "sociales y ciudadanas": "Sociales y ciudadanas",
+    }
+    
+    claves = {}
+    
+    for col_preg, col_resp, nombre_norm in materias_info:
+        # Determinar nombre display
+        display = nombre_display.get(nombre_norm, nombre_norm.title())
+        claves[display] = {}
+        
+        for line in lines[1:]:
+            campos = line.split(",")
+            if col_preg >= len(campos) or col_resp >= len(campos):
+                continue
+            
+            val_preg = campos[col_preg].strip()
+            val_resp = campos[col_resp].strip().upper()
+            
+            if val_preg and val_resp:
+                try:
+                    num_preg = str(int(float(val_preg)))
+                    claves[display][num_preg] = val_resp
+                except (ValueError, TypeError):
+                    continue
+    
+    return claves
+
+
 # ─────────────────────────────────────────────
 # 🔹 BANNER
 # ─────────────────────────────────────────────
@@ -389,42 +473,14 @@ if json_file and csv_file:
     respuestas_raw = data.get("respuestas", {})
     respuestas_map = {normalizar(k): v for k, v in respuestas_raw.items()}
 
-    df = pd.read_csv(csv_file)
+    # ── Parsear CSV con formato de columnas pareadas ──
+    claves = parsear_csv_respuestas(csv_file)
 
-    columnas_materias = {
-        "lectura": "Lectura crítica",
-        "matematicas": "Matemáticas",
-        "naturales": "Ciencias naturales",
-        "sociales": "Sociales y ciudadanas",
-        "ingles": "Inglés",
-    }
-
-    nombres = [
+    # Orden de materias para mostrar
+    orden_materias = [
         "Lectura crítica", "Matemáticas", "Ciencias naturales",
         "Sociales y ciudadanas", "Inglés",
     ]
-
-    df.columns = [normalizar(str(c)) for c in df.columns]
-    col_pregunta = df.columns[0]
-
-    claves = {}
-    for col_csv, nombre_mat in columnas_materias.items():
-        col_encontrada = None
-        for c in df.columns:
-            if col_csv in normalizar(c):
-                col_encontrada = c
-                break
-        if col_encontrada is None:
-            continue
-        claves[nombre_mat] = {}
-        for _, row in df.iterrows():
-            p = row[col_pregunta]
-            r = row[col_encontrada]
-            if pd.notna(p) and pd.notna(r):
-                try:
-                    claves[nombre_mat][str(int(float(p)))] = str(r).strip().upper()
-                except (ValueError, TypeError):
-                    continue
 
     # ── Calcular resultados ──
     resultados_pct = {}
@@ -433,13 +489,29 @@ if json_file and csv_file:
     pesos = {}
     detalle_por_materia = {}
 
-    for materia in nombres:
+    for materia in orden_materias:
         if materia == "Inglés" and not activar_ingles:
             continue
         if materia not in claves:
             continue
 
-        resp_est = respuestas_map.get(normalizar(materia), {})
+        # Buscar las respuestas del estudiante para esta materia
+        # Intentar con el nombre normalizado de la materia
+        materia_norm = normalizar(materia)
+        resp_est = respuestas_map.get(materia_norm, {})
+        
+        # Si no se encontró, intentar con variantes parciales
+        if not resp_est:
+            for key_norm, val in respuestas_map.items():
+                # Buscar coincidencias parciales
+                if ("lectura" in materia_norm and "lectura" in key_norm) or \
+                   ("matematica" in materia_norm and "matematica" in key_norm) or \
+                   ("natural" in materia_norm and "natural" in key_norm) or \
+                   ("social" in materia_norm and "social" in key_norm) or \
+                   ("ingles" in materia_norm and "ingles" in key_norm):
+                    resp_est = val
+                    break
+
         resp_correctas = claves[materia]
         correctas = 0
         total = len(resp_correctas)
@@ -469,7 +541,7 @@ if json_file and csv_file:
     st.markdown(f'<div class="nombre-estudiante">👤 Estudiante: <strong>{nombre}</strong></div>', unsafe_allow_html=True)
 
     # ─────────────────────────────────────────
-    # 🔹 PUNTAJE GLOBAL + CARDS (single HTML block)
+    # 🔹 PUNTAJE GLOBAL + CARDS
     # ─────────────────────────────────────────
 
     if tipo_calculo == "Puntaje tipo ICFES":
@@ -484,7 +556,7 @@ if json_file and csv_file:
         puntaje_mostrar = f"{promedio:.1f}"
         puntaje_max = "100%"
 
-    # Cards de materias (full width)
+    # Cards de materias
     st.markdown('<div class="seccion-titulo" style="margin-top:0;">Puntaje por pruebas</div>', unsafe_allow_html=True)
     n_materias = len(resultados_pct)
     cols_mat = st.columns(n_materias if n_materias > 0 else 1)
@@ -504,7 +576,7 @@ if json_file and csv_file:
 <div class="barra-container"><div class="barra-fill {color}" style="width: {porcentaje}%"></div></div>
 </div>""", unsafe_allow_html=True)
 
-    # Puntaje global (debajo)
+    # Puntaje global
     st.markdown(f"""<div class="puntaje-global">
 <div class="icono-trofeo">🏆</div>
 <div class="pg-texto"><div class="label">Puntaje global</div></div>
